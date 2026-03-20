@@ -15,10 +15,27 @@ class MinariTrajectoryDataset(torch.utils.data.Dataset):
         self.states = []
         self.actions = []
         for ep in dataset:
-            self.states.extend(ep["observations"])
-            self.actions.extend(ep["actions"])
+            if len(ep.observations) == 0:
+                print(f"Warning: empty episode skipped")
+                continue
+            self.states.extend(ep.observations)
+            self.actions.extend(ep.actions)
+        if len(self.states) == 0:
+            raise ValueError("No valid episodes found in dataset")
         self.states = torch.tensor(np.array(self.states), dtype=torch.float32)
         self.actions = torch.tensor(np.array(self.actions), dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.states)
+
+    def __getitem__(self, idx):
+        return self.states[idx], self.actions[idx]
+
+    def __len__(self):
+        return len(self.states)
+
+    def __getitem__(self, idx):
+        return self.states[idx], self.actions[idx]
 
     def __len__(self):
         return len(self.states)
