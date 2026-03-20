@@ -1,0 +1,6 @@
+torch>=2.4.0
+gymnasium[mujoco]>=1.0.0
+minari>=0.5.0
+imageio>=2.0
+numpy
+tqdm
