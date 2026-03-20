@@ -74,3 +74,37 @@ class DiT1D(nn.Module):
             'subgoal': subgoal,
             'switch_prob': switch_prob
         }
+
+class ValueCritic(nn.Module):
+    """Twin Q-critics + target networks with Polyak averaging (τ=0.005).  
+    Used in ReinFlow PPO phase for value estimation and advantage computation."""
+    def __init__(self, state_dim: int, hidden_dim: int = 256):
+        super().__init__()
+        def mlp():
+            return nn.Sequential(
+                nn.Linear(state_dim, hidden_dim), nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+                nn.Linear(hidden_dim, 1)
+            )
+        self.net1 = mlp()
+        self.net2 = mlp()
+        self.target_net1 = mlp()
+        self.target_net2 = mlp()
+
+        # Hard copy online → target at init
+        for target, online in zip([self.target_net1, self.target_net2], [self.net1, self.net2]):
+            target.load_state_dict(online.state_dict())
+
+    def forward(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return twin Q-values."""
+        return self.net1(state), self.net2(state)
+
+    def target_forward(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return twin target Q-values (for min in TD target)."""
+        return self.target_net1(state), self.target_net2(state)
+
+    def update_targets(self, tau: float = 0.005):
+        """Polyak averaging: target ← τ * online + (1-τ) * target"""
+        for target, online in zip([self.target_net1, self.target_net2], [self.net1, self.net2]):
+            for p_t, p_o in zip(target.parameters(), online.parameters()):
+                p_t.data.copy_(tau * p_o.data + (1 - tau) * p_t.data)
