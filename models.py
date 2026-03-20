@@ -39,3 +39,43 @@ class DiT1D(nn.Module):
         escape = self.escape_head(feat) if meta_score.mean() < 1.05 else torch.zeros_like(vel)
         completion = self.completion_head(feat.mean(dim=1))
         return {'velocity': vel, 'escape': escape, 'completion': completion, 'meta_score': meta_score, 'subgoal': subgoal, 'switch_prob': switch_prob}
+
+class ValueCritic(nn.Module):
+    """Twin critics + target networks (Polyak τ=0.005)"""
+    def __init__(self, state_dim: int, hidden_dim: int = 256):
+        super().__init__()
+        self.net1 = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+        self.net2 = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+        self.target_net1 = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+        self.target_net2 = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+        # Initialize targets with online weights
+        for target, online in zip([self.target_net1, self.target_net2], [self.net1, self.net2]):
+            for p_t, p_o in zip(target.parameters(), online.parameters()):
+                p_t.data.copy_(p_o.data)
+
+    def forward(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.net1(state), self.net2(state)
+
+    def target_forward(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.target_net1(state), self.target_net2(state)
+
+    def update_targets(self, tau: float = 0.005):
+        for target, online in zip([self.target_net1, self.target_net2], [self.net1, self.net2]):
+            for p_t, p_o in zip(target.parameters(), online.parameters()):
+                p_t.data.copy_(tau * p_o.data + (1 - tau) * p_t.data)
