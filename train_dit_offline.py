@@ -30,7 +30,7 @@ def train_dit_offline(env_name: str = "Hopper-v5", epochs: int = 50, batch_size:
     ds_id = f"mujoco/{env_name.lower().replace('-v5','')}/medium-v0"
     if "antmaze" in env_name.lower():
         ds_id = "D4RL/antmaze/large-play-v1"
-    dataset = minari.load_dataset(ds_id)
+    dataset = minari.load_dataset(ds_id, download=True)
     env = gym.make(env_name)
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
