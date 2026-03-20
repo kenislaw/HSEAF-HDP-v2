@@ -7,7 +7,8 @@ class HierarchicalMetaNet(nn.Module):
         self.subgoal_head = nn.Linear(hidden_dim, goal_dim)
         self.switch_vote = nn.Linear(hidden_dim, 1)
     def forward(self, feat):
-        meta = self.meta_net(feat.mean(dim=1))
-        subgoal = self.subgoal_head(feat.mean(dim=1))
-        switch = torch.sigmoid(self.switch_vote(feat.mean(dim=1)))
+        meta = self.meta_net(feat)                # [B, 1]
+        subgoal = self.subgoal_head(feat)         # [B, goal_dim]
+        switch = torch.sigmoid(self.switch_vote(feat))  # [B, 1]
         return meta, subgoal, switch
+
