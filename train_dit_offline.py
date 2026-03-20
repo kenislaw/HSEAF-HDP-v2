@@ -43,7 +43,7 @@ class MinariTrajectoryDataset(torch.utils.data.Dataset):
             raise IndexError(f"Index {idx} out of bounds (states len: {len(self.states)}, actions len: {len(self.actions)})")
         return self.states[idx], self.actions[idx]
 
-def train_dit_offline(env_name: str = "Hopper-v5", epochs: int = 50, batch_size: int = 256, lr: float = 3e-4):
+def train_dit_offline(env_name: str = "Hopper-v5", epochs: int = 100, batch_size: int = 256, lr: float = 3e-4):
     ds_id = f"mujoco/{env_name.lower().replace('-v5','')}/medium-v0"
     if "antmaze" in env_name.lower():
         ds_id = "D4RL/antmaze/large-play-v1"
