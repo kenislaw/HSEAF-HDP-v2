@@ -32,7 +32,7 @@ def reinflow_finetune(env_name: str = "Hopper-v5", epochs: int = 100, rollout_st
     ds_id = f"mujoco/{env_name.lower().replace('-v5','')}/medium-v0"
     if "antmaze" in env_name.lower():
         ds_id = "D4RL/antmaze/large-play-v1"
-    dataset = minari.load_dataset(ds_id)
+    dataset = minari.load_dataset(ds_id, download=True)
 
     model.train()
     for epoch in tqdm(range(epochs), desc="ReinFlow Fine-tune"):
