@@ -10,7 +10,6 @@ import argparse
 import numpy as np
 import platform
 
-# === Safe globals for checkpoint compatibility (covers all numpy types seen so far) ===
 torch.serialization.add_safe_globals([
     np._core.multiarray.scalar,
     np.dtype,
@@ -22,7 +21,7 @@ from utils import make_d4rl_score
 
 
 class MinariTrajectoryDataset(torch.utils.data.Dataset):
-    def __init__(self, dataset):
+    def __init__(self, dataset, device):
         self.states = []
         self.actions = []
         skipped = 0
@@ -41,29 +40,26 @@ class MinariTrajectoryDataset(torch.utils.data.Dataset):
             raise ValueError("No valid transitions found in dataset")
         if len(self.states) != len(self.actions):
             raise RuntimeError(f"Length mismatch: states={len(self.states)}, actions={len(self.actions)}")
-        self.states = torch.tensor(np.array(self.states), dtype=torch.float32)
-        self.actions = torch.tensor(np.array(self.actions), dtype=torch.float32)
-        print(f"Loaded {len(self.states)} valid transitions")
+        self.states = torch.tensor(np.array(self.states), dtype=torch.float32).to(device)
+        self.actions = torch.tensor(np.array(self.actions), dtype=torch.float32).to(device)
+        print(f"Pre-loaded dataset to GPU ({device}) | {len(self.states):,} transitions")
 
     def __len__(self):
         return len(self.states)
 
     def __getitem__(self, idx):
-        if idx >= len(self.states) or idx >= len(self.actions):
-            raise IndexError(f"Index {idx} out of bounds")
         return self.states[idx], self.actions[idx]
 
 
 def train_dit_offline(
     env_name: str = "Hopper-v5",
-    epochs: int = 20,
-    micro_batch_size: int = 256,
-    grad_accum_steps: int = 4,
+    epochs: int = 100,
+    micro_batch_size: int = 131072,
+    grad_accum_steps: int = 1,
     lr: float = 3e-4,
-    eval_freq: int = 10,
-    num_workers: int = 8,
+    eval_freq: int = 20,
+    num_workers: int = 4,
 ):
-    # === Blackwell efficiency settings ===
     torch.backends.cuda.enable_flash_sdp(False)
     torch.backends.cuda.enable_mem_efficient_sdp(False)
     torch.backends.cuda.enable_math_sdp(True)
@@ -85,14 +81,22 @@ def train_dit_offline(
     print(f"Using device: {device} | {torch.cuda.get_device_name(0) if device.type == 'cuda' else 'CPU'}")
 
     effective_batch = micro_batch_size * grad_accum_steps
-    lr_scaled = lr * (effective_batch / 256.0)
+    lr_scaled = lr * (effective_batch ** 0.5 / 256.0)
     print(f"Effective batch size: {effective_batch} | Scaled LR: {lr_scaled:.2e}")
 
     model = DiT1D(state_dim, action_dim).to(device)
+    print(f"Model params device: {next(model.parameters()).device}")
+    print(f"Total model params: {sum(p.numel() for p in model.parameters()):,}")
+
     print("Running in eager mode (Triton unavailable on Windows)")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr_scaled)
     scaler = torch.amp.GradScaler('cuda', enabled=True)
+
+    # === Scheduler (warmup → cosine) ===
+    warmup_epochs = 10
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs, eta_min=lr_scaled * 0.01)
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, total_iters=warmup_epochs)
 
     ckpt_dir = f"checkpoints/{env_name.lower()}"
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -100,12 +104,10 @@ def train_dit_offline(
     final_path = f"hseaf_{env_name.lower()}_offline.pt"
     best_path = f"hseaf_{env_name.lower()}_offline_best.pt"
 
-    # === Smart resume: prefer latest interrupted checkpoint ===
     best_return = -float("inf")
     start_epoch = 0
     resume_path = None
 
-    # Find latest interrupted checkpoint
     latest_epoch = -1
     for f in os.listdir(ckpt_dir):
         if f.startswith("interrupted_epoch_"):
@@ -121,30 +123,33 @@ def train_dit_offline(
         try:
             ckpt = torch.load(resume_path, map_location=device)
             model.load_state_dict(ckpt["model"])
+            model = model.to(device)
+            optimizer = torch.optim.Adam(model.parameters(), lr=lr_scaled)
             start_epoch = ckpt.get("epoch", 0)
             best_return = ckpt.get("avg_return", -float("inf"))
-            print(f"Resumed from INTERRUPTED checkpoint → {resume_path} (epoch {start_epoch})")
+            print(f"Resumed INTERRUPTED checkpoint → {resume_path} (epoch {start_epoch})")
         except Exception as e:
             print(f"Interrupted resume failed: {e}")
     elif os.path.exists(best_path):
         try:
             ckpt = torch.load(best_path, map_location=device)
             model.load_state_dict(ckpt["model"])
+            model = model.to(device)
+            optimizer = torch.optim.Adam(model.parameters(), lr=lr_scaled)
             best_return = ckpt.get("avg_return", -float("inf"))
             start_epoch = ckpt.get("epoch", 0)
             print(f"Resumed BEST checkpoint (return: {best_return:.2f})")
         except Exception as e:
             print(f"Best resume failed: {e} → starting fresh")
 
-    traj_ds = MinariTrajectoryDataset(dataset)
+    traj_ds = MinariTrajectoryDataset(dataset, device)
     loader = DataLoader(
         traj_ds,
         batch_size=micro_batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=False,
         persistent_workers=(num_workers > 0),
-        prefetch_factor=2 if num_workers > 0 else None,
     )
 
     def quick_eval(model, env, n_ep=5, max_steps=1000):
@@ -183,9 +188,6 @@ def train_dit_offline(
             optimizer.zero_grad(set_to_none=True)
 
             for i, (states, actions) in enumerate(tqdm(loader, desc=f"Epoch {epoch+1}")):
-                states = states.to(device, non_blocking=True)
-                actions = actions.to(device, non_blocking=True)
-
                 fwd_start = time.perf_counter()
                 with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
                     t = torch.rand(len(states), device=device)
@@ -201,6 +203,7 @@ def train_dit_offline(
 
                 bwd_start = time.perf_counter()
                 scaler.scale(loss / grad_accum_steps).backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 backward_time += time.perf_counter() - bwd_start
 
                 epoch_loss += loss.item() * states.size(0) * grad_accum_steps
@@ -217,6 +220,12 @@ def train_dit_offline(
 
             print(f"Epoch {epoch+1} Loss: {avg_loss:.6f} | Peak VRAM: {peak_vram:.1f} GB")
             print(f"  Time: {epoch_time:.1f}s total | Forward: {forward_time:.1f}s | Backward: {backward_time:.1f}s")
+
+            # === CORRECT SCHEDULER PLACEMENT: AFTER full accumulation & optimizer.step() ===
+            if epoch < warmup_epochs:
+                warmup_scheduler.step()
+            else:
+                scheduler.step()
 
             if device.type == "cuda":
                 torch.cuda.empty_cache()
@@ -251,9 +260,8 @@ def train_dit_offline(
         }
         torch.save(checkpoint, interrupted_path)
         print(f"Interrupted state saved → {interrupted_path}")
-        raise  # re-raise so user sees the stop
+        raise
 
-    # Final save
     torch.save({
         "model": model.state_dict(),
         "epoch": epoch + 1,
@@ -266,12 +274,12 @@ def train_dit_offline(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Offline DiT pre-training - HSEAF-HDP v2")
     parser.add_argument("--env", default="Hopper-v5")
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--micro-batch-size", type=int, default=1024)   # increased safely
-    parser.add_argument("--grad-accum-steps", type=int, default=2)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--micro-batch-size", type=int, default=131072)
+    parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--eval-freq", type=int, default=10)
-    parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument("--eval-freq", type=int, default=20)
+    parser.add_argument("--num-workers", type=int, default=4)
     args = parser.parse_args()
 
     train_dit_offline(
