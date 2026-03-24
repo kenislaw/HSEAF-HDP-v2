@@ -1,75 +1,128 @@
 import os
-import time
+import copy
 import torch
 import torch.nn.functional as F
 import minari
 import gymnasium as gym
+import numpy as np
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import argparse
-import numpy as np
-import copy
+from dataclasses import dataclass
+from torch.utils.tensorboard import SummaryWriter
+import warnings
 
-torch.serialization.add_safe_globals([
-    np._core.multiarray.scalar,
-    np.dtype,
-    np.dtypes.Float64DType
-])
+# ====================== GLOBAL SETTINGS ======================
+warnings.filterwarnings("ignore", category=UserWarning)
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-from models import DiT1D
-from utils import make_d4rl_score
+torch.backends.cuda.enable_flash_sdp(True)
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.set_float32_matmul_precision('high')
 
-class SimpleCritic(torch.nn.Module):
-    def __init__(self, state_dim, action_dim):
+# ====================== CONFIG ======================
+@dataclass
+class Config:
+    env_name: str = "Hopper-v5"
+    epochs: int = 2000
+    micro_batch: int = 16384
+    grad_accum: int = 8
+    lr: float = 3e-4
+    eval_freq: int = 5
+    target_rtg: float = 950.0
+    inference_steps: int = 30
+    device: torch.device = torch.device("cuda")
+    embed_dim: int = 256
+    depth: int = 6
+    meta_start: int = 30
+
+
+def cosine_beta_schedule(timesteps: int = 1000, s: float = 0.008):
+    steps = timesteps + 1
+    x = torch.linspace(0, timesteps, steps)
+    alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * torch.pi * 0.5) ** 2
+    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+    return torch.clamp(betas, 0.0001, 0.9999)
+
+
+# ====================== MODEL ======================
+class DiT1D(torch.nn.Module):
+    def __init__(self, state_dim: int, action_dim: int, embed_dim: int = 256, depth: int = 6):
         super().__init__()
-        self.net = torch.nn.Sequential(
-            torch.nn.Linear(state_dim + action_dim, 256),
-            torch.nn.ReLU(),
-            torch.nn.Linear(256, 256),
-            torch.nn.ReLU(),
-            torch.nn.Linear(256, 1)
+        self.embed_dim = embed_dim
+        self.state_embed = torch.nn.Linear(state_dim, embed_dim)
+        self.action_embed = torch.nn.Linear(action_dim, embed_dim)
+        self.time_embed = torch.nn.Sequential(
+            torch.nn.Linear(1, embed_dim), torch.nn.SiLU(), torch.nn.Linear(embed_dim, embed_dim)
         )
-    def forward(self, s, a):
-        return self.net(torch.cat([s, a], dim=-1))
+        self.rtg_proj = torch.nn.Linear(1, embed_dim)
+        layer = torch.nn.TransformerEncoderLayer(
+            d_model=embed_dim, nhead=8, dim_feedforward=embed_dim * 4,
+            activation='gelu', batch_first=True, norm_first=True
+        )
+        self.transformer = torch.nn.TransformerEncoder(layer, num_layers=depth)
+        self.eps_head = torch.nn.Linear(embed_dim, action_dim)
+        self.meta_head = torch.nn.Linear(embed_dim, 1)
 
+    def forward(self, state, x_t, t, rtg=None):
+        s_emb = self.state_embed(state)
+        if rtg is not None:
+            s_emb = s_emb + self.rtg_proj(rtg.unsqueeze(-1))
+        x_emb = self.action_embed(x_t)
+        t_emb = self.time_embed(t.view(-1, 1))
+        x = torch.stack([s_emb, x_emb, t_emb], dim=1)
+        x = self.transformer(x)
+        return {
+            "eps": self.eps_head(x[:, 1, :]),
+            "meta": self.meta_head(x.mean(dim=1)).squeeze(-1)
+        }
+
+
+# ====================== DATASET ======================
 class MinariTrajectoryDataset(torch.utils.data.Dataset):
     def __init__(self, dataset, device):
         self.states = []
         self.actions = []
-        self.returns = []
-        skipped = 0
+        self.raw_returns = []
         for ep in dataset:
-            obs = ep.observations
-            acts = ep.actions
-            rews = getattr(ep, 'rewards', np.zeros(len(acts)))
-            min_len = min(len(obs), len(acts), len(rews))
+            min_len = min(len(ep.observations), len(ep.actions))
             if min_len == 0:
-                skipped += 1
                 continue
-            self.states.extend(obs[:min_len])
-            self.actions.extend(acts[:min_len])
-            cum_ret = np.cumsum(rews[:min_len][::-1])[::-1]
-            self.returns.extend(cum_ret)
-        if skipped > 0:
-            print(f"Warning: skipped {skipped} empty/invalid episodes")
-        if len(self.states) == 0:
-            raise ValueError("No valid transitions found in dataset")
-        self.states = torch.tensor(np.array(self.states), dtype=torch.float32).to(device)
-        self.actions = torch.tensor(np.array(self.actions), dtype=torch.float32).to(device)
-        returns_array = np.array(self.returns)
-        if returns_array.max() > returns_array.min():
-            norm_returns = (returns_array - returns_array.min()) / (returns_array.max() - returns_array.min() + 1e-8)
-        else:
-            norm_returns = np.zeros_like(returns_array)
-        self.returns = torch.tensor(norm_returns, dtype=torch.float32).to(device)
-        print(f"Pre-loaded dataset to GPU ({device}) | {len(self.states):,} transitions | Returns normalized [0,1] for meta")
+            self.states.extend(ep.observations[:min_len])
+            self.actions.extend(ep.actions[:min_len])
+            cum_ret = np.cumsum(getattr(ep, 'rewards', np.zeros(min_len))[::-1])[::-1]
+            self.raw_returns.extend(cum_ret)
+
+        self.states_np = np.array(self.states, dtype=np.float32)
+        self.state_mean = self.states_np.mean(0)
+        self.state_std = self.states_np.std(0) + 1e-6
+        self.states = torch.tensor(
+            (self.states_np - self.state_mean) / self.state_std, dtype=torch.float32
+        ).to(device)
+
+        self.actions_np = np.array(self.actions, dtype=np.float32)
+        self.action_mean = self.actions_np.mean(0)
+        self.action_std = self.actions_np.std(0) + 1e-6
+        self.actions = torch.tensor(
+            (self.actions_np - self.action_mean) / self.action_std, dtype=torch.float32
+        ).to(device)
+
+        returns_array = np.clip(np.array(self.raw_returns), 0, 3500)
+        self.raw_returns = torch.tensor(returns_array, dtype=torch.float32).to(device)
+        self.returns = self.raw_returns / 1000.0
+
+        print(f"Pre-loaded dataset to GPU | {len(self.states):,} transitions "
+              f"(returns clipped & scaled /1000)")
 
     def __len__(self):
         return len(self.states)
 
     def __getitem__(self, idx):
-        return self.states[idx], self.actions[idx], self.returns[idx]
+        return self.states[idx], self.actions[idx], self.returns[idx], self.raw_returns[idx]
 
+
+# ====================== EMA ======================
 class EMA:
     def __init__(self, model, decay=0.999):
         self.shadow = copy.deepcopy(model)
@@ -82,402 +135,229 @@ class EMA:
     def state_dict(self):
         return self.shadow.state_dict()
 
-class MetaController:
-    def __init__(self, hyper_params=None):
-        self.meta_weight = 0.05
-        self.meta_weight_floor = 0.05
-        self.beta_alpha = 5.0
-        self.beta_beta = 1.0
-        self.stagnation_counter = 0
-        self.best_return = -float("inf")
-        self.last_returns = []
-        self.hyper = hyper_params or {}
 
-    def update(self, avg_return, avg_loss):
-        self.last_returns.append(avg_return)
-        if len(self.last_returns) > 10:
-            self.last_returns.pop(0)
-        recent_avg = np.mean(self.last_returns[-5:]) if self.last_returns else avg_return
-        if recent_avg > self.best_return:
-            self.best_return = recent_avg
-            self.stagnation_counter = 0
-        else:
-            self.stagnation_counter += 1
-        if self.stagnation_counter > self.hyper.get("stagnation_threshold", 8):
-            self.meta_weight = min(0.30, self.meta_weight * 1.22)
-            self.beta_alpha = max(2.0, self.beta_alpha * 0.90)
-            if self.stagnation_counter > 12:
-                print("  → Stagnation detected: triggering warm LR restart")
-                self.stagnation_counter = 0
-                return True
-        else:
-            self.meta_weight = max(self.meta_weight_floor, self.meta_weight * 0.96)
-            self.beta_alpha = min(8.0, self.beta_alpha * 1.04)
-        return False
+# ====================== EVALUATOR ======================
+class QuickEvaluator:
+    def __init__(self, traj_ds, device, target_rtg=950.0):
+        self.traj_ds = traj_ds
+        self.device = device
+        self.target_rtg = target_rtg / 1000.0
+        self.betas = cosine_beta_schedule()
+        self.alphas_cumprod = torch.cumprod(1 - self.betas, dim=0).to(device)
 
-class HyperMetaController:
-    def __init__(self):
-        self.stagnation_threshold = 8
-        self.clamp_max = 8.0
-        self.clamp_min = 0.0005
-        self.grace_epochs = 12
-        self.low_vel_counter = 0
+    def evaluate(self, model, env, n_ep=3, steps=30):
+        model.eval()
+        returns = []
+        all_heights = []
+        all_actions = []
+        stride = max(1, 1000 // steps)
+        rtg_t = torch.full((1,), self.target_rtg, device=self.device)
 
-    def update(self, avg_return, loss_std, return_std, vel_loss):
-        meta_reward = (avg_return / (return_std + 1e-6)) - (loss_std * 8)
-        if vel_loss < 0.36:
-            self.low_vel_counter += 1
-            if self.low_vel_counter > 50:
-                self.clamp_min = max(0.0001, self.clamp_min * 0.90)
-        else:
-            self.low_vel_counter = 0
-        if meta_reward > 5:
-            self.stagnation_threshold = max(4, min(12, int(self.stagnation_threshold * 0.97)))
-        return {
-            "stagnation_threshold": self.stagnation_threshold,
-            "clamp_max": self.clamp_max,
-            "grace_epochs": self.grace_epochs
-        }
+        print(f"\n{'='*70}")
+        print(f"→ Eval {n_ep}×2 episodes (DDIM steps={steps})...")
 
-class OuterController:
-    def __init__(self):
-        self.last_losses = []
-        self.last_returns = []
-        self.last_meta_weights = []
-        self.return_ema = 0.0
-        self.ema_alpha = 0.85
+        for ep_idx in range(n_ep):
+            for s_idx in range(2):
+                obs, _ = env.reset()
+                ep_ret = 0.0
+                ep_heights = []
+                ep_actions = []
 
-    def update(self, avg_loss, avg_return, current_meta_weight, return_std):
-        self.last_losses.append(avg_loss)
-        self.last_returns.append(avg_return)
-        self.last_meta_weights.append(current_meta_weight)
-        if len(self.last_losses) > 40:
-            self.last_losses.pop(0)
-            self.last_returns.pop(0)
-            self.last_meta_weights.pop(0)
-        loss_std = np.std(self.last_losses) if len(self.last_losses) > 15 else 0
-        self.return_ema = self.ema_alpha * self.return_ema + (1 - self.ema_alpha) * avg_return
-        spike = avg_loss > 0.45
-        high_vol = return_std > 90
-        if spike or high_vol:
-            print("  → OuterController: SPIKE or HIGH VOL – forcing aggressive warm restart")
-            return True, loss_std, return_std, True
-        if avg_loss < 0.37 and avg_return > self.return_ema + 25 and return_std < 40:
-            print("  → OuterController: Strong stable improvement + low vol – boosting meta_weight + floor")
-            return False, loss_std, return_std, True
-        return False, loss_std, return_std, False
+                for _ in range(1000):
+                    x_t = torch.randn((1, env.action_space.shape[0]), device=self.device)
 
-def train_dit_offline(
-    env_name: str = "Hopper-v5",
-    epochs: int = 100,
-    micro_batch_size: int = 131072,
-    grad_accum_steps: int = 1,
-    lr: float = 3e-4,
-    eval_freq: int = 20,
-    num_workers: int = 4,
-):
-    torch.backends.cuda.enable_flash_sdp(False)
-    torch.backends.cuda.enable_mem_efficient_sdp(False)
-    torch.backends.cuda.enable_math_sdp(True)
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    torch.set_float32_matmul_precision('high')
-    torch.backends.cudnn.benchmark = True
+                    for d in range(steps):
+                        t_idx = 999 - d * stride
+                        t = torch.full((1,), t_idx / 1000.0, device=self.device)
+                        progress = d / steps
+                        guidance = 0.5 + 4.0 * (1 - progress ** 0.6)
 
-    ds_id = f"mujoco/{env_name.lower().replace('-v5', '')}/medium-v0"
-    if "antmaze" in env_name.lower():
-        ds_id = "D4RL/antmaze/large-play-v1"
+                        state_t = torch.from_numpy(
+                            (obs - self.traj_ds.state_mean) / self.traj_ds.state_std
+                        ).float().unsqueeze(0).to(self.device)
 
+                        with torch.no_grad():
+                            out_c = model(state_t, x_t, t, rtg=rtg_t)
+                            out_u = model(state_t, x_t, t, rtg=None)
+                            eps = out_u["eps"] + guidance * (out_c["eps"] - out_u["eps"])
+
+                        alpha_t = self.alphas_cumprod[t_idx]
+                        alpha_p = self.alphas_cumprod[max(0, t_idx - stride)]
+                        pred_x0 = (x_t - torch.sqrt(1 - alpha_t) * eps) / torch.sqrt(alpha_t)
+                        x_t = torch.sqrt(alpha_p) * pred_x0 + torch.sqrt(1 - alpha_p) * eps
+                        x_t = x_t.clamp(-2.5, 2.5)
+
+                    act_norm = x_t[0].cpu().numpy()
+                    act = (act_norm * self.traj_ds.action_std + self.traj_ds.action_mean).clip(
+                        env.action_space.low * 0.95, env.action_space.high * 0.95)
+
+                    obs, r, term, trunc, _ = env.step(act)
+                    ep_ret += r
+                    ep_heights.append(obs[0])
+                    ep_actions.append(np.abs(act).mean())
+
+                    if term or trunc or obs[0] < 0.7:
+                        break
+
+                returns.append(ep_ret)
+                all_heights.extend(ep_heights)
+                all_actions.extend(ep_actions)
+
+                print(f"  [{ep_idx}][{s_idx}] ret={ep_ret:7.1f} len={len(ep_heights):3d} "
+                      f"max_h={max(ep_heights):.2f} act_norm={np.mean(ep_actions):.3f}")
+
+        avg_ret = np.mean(returns)
+        ret_std = np.std(returns)
+        avg_h = np.mean(all_heights)
+        h_min, h_max = np.min(all_heights), np.max(all_heights)
+        avg_act = np.mean(all_actions)
+        early_death_pct = 100 * sum(h < 0.7 for h in all_heights) / len(all_heights)
+
+        bins = [0.0, 0.7, 1.0, 1.3, 1.6, 2.0]
+        hist, _ = np.histogram(all_heights, bins=bins)
+        hist_str = " | ".join([f"{bins[i]:.1f}-{bins[i+1]:.1f}:{hist[i]/len(all_heights)*100:4.0f}%" for i in range(len(hist))])
+
+        print(f"{'-'*70}")
+        print(f"DEBUG EVAL → avg_ret={avg_ret:6.1f}±{ret_std:.1f} | avg_height={avg_h:.2f} "
+              f"(min={h_min:.2f}, max={h_max:.2f}) | action_norm={avg_act:.3f}")
+        print(f"             early_death={early_death_pct:.1f}% | height_dist: {hist_str}")
+        print(f"{'='*70}\n")
+
+        model.train()
+        return avg_ret
+
+
+# ====================== MAIN TRAINER ======================
+def train_dit_offline(cfg: Config):
+    effective_batch = cfg.micro_batch * cfg.grad_accum
+    lr_scaled = cfg.lr * (effective_batch ** 0.5 / 256)
+
+    print(f"Using device: {cfg.device} | {torch.cuda.get_device_name(0)}")
+    print(f"Effective batch size: {effective_batch} | Scaled LR: {lr_scaled:.2e}")
+
+    ds_id = f"mujoco/{cfg.env_name.lower().replace('-v5', '')}/medium-v0"
     dataset = minari.load_dataset(ds_id, download=True)
-    env = gym.make(env_name)
+    env = gym.make(cfg.env_name)
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device} | {torch.cuda.get_device_name(0) if device.type == 'cuda' else 'CPU'}")
+    model = DiT1D(state_dim, action_dim, cfg.embed_dim, cfg.depth).to(cfg.device)
 
-    effective_batch = micro_batch_size * grad_accum_steps
-    lr_scaled = lr * (effective_batch ** 0.5 / 256.0)
-    print(f"Effective batch size: {effective_batch} | Scaled LR: {lr_scaled:.2e}")
+    # Force eager mode - torch.compile is broken on RTX 5070 (Blackwell + Triton missing)
+    print("torch.compile disabled (Blackwell GPU) → using eager mode for stability")
 
-    model = DiT1D(state_dim, action_dim).to(device)
     ema = EMA(model)
-    critic = SimpleCritic(state_dim, action_dim).to(device)
-    critic_optimizer = torch.optim.AdamW(critic.parameters(), lr=1e-3)
-    hyper_ctrl = HyperMetaController()
-    meta_ctrl = MetaController(hyper_params=hyper_ctrl.update(0, 0, 0, 0))
-    outer_ctrl = OuterController()
-
-    print(f"Model params device: {next(model.parameters()).device}")
-    print(f"Total model params: {sum(p.numel() for p in model.parameters()):,}")
-
-    print("Running in eager mode (Triton unavailable on Windows)")
-
-    # CRITICAL FIX: Force num_workers=0 on CUDA (prevents IPC OOM)
-    effective_workers = 0 if device.type == "cuda" else num_workers
-    if num_workers > 0 and device.type == "cuda":
-        print(f"WARNING: num_workers={num_workers} overridden to 0 (CUDA GPU-preload + multiprocessing causes OOM on Windows)")
+    traj_ds = MinariTrajectoryDataset(dataset, cfg.device)
+    loader = DataLoader(traj_ds, batch_size=cfg.micro_batch, shuffle=True, num_workers=0, pin_memory=False)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr_scaled, weight_decay=1e-4)
-    scaler = torch.amp.GradScaler('cuda', enabled=True)
+    scaler = torch.amp.GradScaler('cuda')
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=300, eta_min=1e-4)
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_0=300, T_mult=1, eta_min=5e-6
-    )
-    meta_plateau = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=6, min_lr=5e-6
-    )
+    log_dir = f"runs/{cfg.env_name.lower()}_dit_v32"
+    writer = SummaryWriter(log_dir)
+    print(f"TensorBoard logging enabled → {log_dir}")
+    print("   View with: tensorboard --logdir runs\n")
 
-    ckpt_dir = f"checkpoints/{env_name.lower()}"
-    os.makedirs(ckpt_dir, exist_ok=True)
+    evaluator = QuickEvaluator(traj_ds, cfg.device, cfg.target_rtg)
 
-    best_path = f"hseaf_{env_name.lower()}_offline_best.pt"
+    meta_weight = 0.08
+    print("Starting training...\n")
 
-    best_score = -float("inf")
-    start_epoch = 0
-    resume_path = None
-
-    latest_epoch = -1
-    for f in os.listdir(ckpt_dir):
-        if f.startswith("interrupted_epoch_"):
-            try:
-                ep_num = int(f.split("_")[2])
-                if ep_num > latest_epoch:
-                    latest_epoch = ep_num
-                    resume_path = os.path.join(ckpt_dir, f)
-            except:
-                pass
-
-    if resume_path:
-        try:
-            ckpt = torch.load(resume_path, map_location=device)
-            model.load_state_dict(ckpt["model"])
-            ema.shadow.load_state_dict(ckpt.get("ema", ckpt["model"]))
-            if "critic" in ckpt:
-                critic.load_state_dict(ckpt["critic"])
-            if "optimizer" in ckpt:
-                optimizer.load_state_dict(ckpt["optimizer"])
-            if "critic_optimizer" in ckpt:
-                critic_optimizer.load_state_dict(ckpt["critic_optimizer"])
-            if "scheduler" in ckpt:
-                scheduler.load_state_dict(ckpt["scheduler"])
-            model = model.to(device)
-            critic = critic.to(device)
-            start_epoch = ckpt.get("epoch", 0)
-            print(f"Resumed INTERRUPTED checkpoint → {resume_path} (epoch {start_epoch})")
-        except Exception as e:
-            print(f"Interrupted resume failed ({e}) → starting fresh")
-
-    traj_ds = MinariTrajectoryDataset(dataset, device)
-    loader = DataLoader(
-        traj_ds,
-        batch_size=micro_batch_size,
-        shuffle=True,
-        num_workers=effective_workers,   # FIXED
-        pin_memory=False,
-        persistent_workers=False,        # FIXED (no multiprocessing)
-    )
-
-    def quick_eval(model_to_eval, env, n_ep=15):
-        model_to_eval.eval()
-        returns = []
-        for _ in range(n_ep):
-            obs, _ = env.reset()
-            ep_ret = 0.0
-            done = False
-            step = 0
-            while not done and step < 1000:
-                with torch.no_grad():
-                    obs_t = torch.from_numpy(obs).float().to(device).unsqueeze(0)
-                    t = torch.zeros(1, device=device)
-                    xt = torch.randn(action_dim, device=device).unsqueeze(0) * 1.0
-                    for _ in range(6):
-                        out = model_to_eval(obs_t, xt, t)
-                        xt = xt - out["velocity"] * 0.25
-                    act = out["velocity"][0].cpu().numpy()
-                obs, rew, terminated, truncated, _ = env.step(act)
-                ep_ret += rew
-                done = terminated or truncated
-                step += 1
-            returns.append(ep_ret)
-        model_to_eval.train()
-        ret_mean = np.mean(returns)
-        ret_std = np.std(returns)
-        return ret_mean, ret_std
-
-    model.train()
-    critic.train()
-    low_vel_counter = 0
     try:
-        for epoch in range(start_epoch, start_epoch + epochs):
-            epoch_start = time.perf_counter()
-            epoch_loss = 0.0
-            vel_loss_sum = 0.0
-            meta_loss_sum = 0.0
-            critic_loss_sum = 0.0
-            n_samples = 0
-            accum_counter = 0
-            optimizer.zero_grad(set_to_none=True)
-            critic_optimizer.zero_grad(set_to_none=True)
+        for epoch in range(cfg.epochs):
+            epoch_loss = eps_loss_sum = meta_loss_sum = n_samples = 0.0
+            optimizer.zero_grad()
 
-            pbar = tqdm(loader, desc=f"Epoch {epoch+1}")
-            for i, (states, actions, norm_returns) in enumerate(pbar):
+            pbar = tqdm(loader, desc=f"Epoch {epoch+1:3d}")
+            for states, actions, _, raw_returns in pbar:
                 with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    if epoch < start_epoch + hyper_ctrl.grace_epochs:
-                        t = torch.rand(len(states), device=device)
-                    else:
-                        t = torch.distributions.Beta(meta_ctrl.beta_alpha, meta_ctrl.beta_beta).sample((len(states),)).to(device)
-
+                    t = torch.rand(len(states), device=cfg.device)
                     noise = torch.randn_like(actions)
-                    xt = (1 - t[:, None]) * noise + t[:, None] * actions
-                    out = model(states, xt, t)
+                    sqrt_alpha = torch.sqrt(1 - t[:, None])
+                    sqrt_one_minus_alpha = torch.sqrt(t[:, None])
+                    x_t = sqrt_alpha * actions + sqrt_one_minus_alpha * noise
 
-                    target_vel = actions - noise
-                    vel_loss = F.mse_loss(out["velocity"], target_vel)
+                    rtg = torch.full((len(states),), cfg.target_rtg / 1000.0, device=cfg.device) \
+                          if torch.rand(1).item() < 0.6 else None
 
-                    q_pred = critic(states, actions)
-                    advantage = norm_returns - q_pred.squeeze(-1).detach()
-                    meta_loss_raw = F.mse_loss(out["meta_score"].squeeze(-1), advantage)
+                    out = model(states, x_t, t, rtg=rtg)
 
-                    if vel_loss.item() < 0.36:
-                        low_vel_counter += 1
-                    else:
-                        low_vel_counter = 0
-                    effective_clamp_min = max(hyper_ctrl.clamp_min, 0.0001 if low_vel_counter > 50 else hyper_ctrl.clamp_min)
-                    meta_loss = torch.clamp(meta_loss_raw, max=hyper_ctrl.clamp_max, min=effective_clamp_min)
+                    eps_loss = F.mse_loss(out["eps"], noise)
+                    meta_loss = F.mse_loss(out["meta"], (raw_returns / 1000.0 - 0.5) * 2.0)
 
-                    loss = vel_loss + meta_ctrl.meta_weight * meta_loss
+                    active_meta = meta_weight if epoch >= cfg.meta_start else 0.0
+                    loss = eps_loss + active_meta * meta_loss
 
-                    critic_loss = F.mse_loss(q_pred.squeeze(-1), norm_returns)
+                scaler.scale(loss).backward()
 
-                scaler.scale(loss / grad_accum_steps).backward(retain_graph=True)
-                critic_loss.backward()
-                accum_counter += 1
-
-                if accum_counter == grad_accum_steps or (i + 1) == len(loader):
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    torch.nn.utils.clip_grad_norm_(critic.parameters(), max_norm=1.0)
+                if (n_samples // cfg.micro_batch + 1) % cfg.grad_accum == 0:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     scaler.step(optimizer)
-                    critic_optimizer.step()
                     scaler.update()
-                    optimizer.zero_grad(set_to_none=True)
-                    critic_optimizer.zero_grad(set_to_none=True)
+                    optimizer.zero_grad()
                     scheduler.step()
-                    meta_plateau.step(meta_loss_raw.item())
                     ema.update(model)
-                    accum_counter = 0
 
-                epoch_loss += loss.item() * states.size(0) * grad_accum_steps
-                vel_loss_sum += vel_loss.item() * states.size(0)
-                meta_loss_sum += meta_loss_raw.item() * states.size(0)
-                critic_loss_sum += critic_loss.item() * states.size(0)
-                n_samples += states.size(0)
+                epoch_loss += loss.item()
+                eps_loss_sum += eps_loss.item()
+                meta_loss_sum += meta_loss.item()
+                n_samples += len(states)
 
-            avg_loss = epoch_loss / n_samples
-            avg_vel = vel_loss_sum / n_samples
-            avg_meta = meta_loss_sum / n_samples
-            avg_critic = critic_loss_sum / n_samples
-            peak_vram = torch.cuda.max_memory_allocated() / 1e9
-
+            avg_loss = epoch_loss / len(loader)
+            avg_eps = eps_loss_sum / len(loader)
+            avg_meta = meta_loss_sum / len(loader)
             current_lr = optimizer.param_groups[0]['lr']
-            print(f"Epoch {epoch+1} Loss: {avg_loss:.6f} (vel: {avg_vel:.6f} | meta: {avg_meta:.6f} | critic: {avg_critic:.6f}) | Peak VRAM: {peak_vram:.1f} GB | LR: {current_lr:.2e}")
-            print(f"  MetaWeight: {meta_ctrl.meta_weight:.3f} | Betaα: {meta_ctrl.beta_alpha:.1f} | HyperClamp: {hyper_ctrl.clamp_max:.1f} | MetaFloor: {meta_ctrl.meta_weight_floor:.3f}")
 
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
+            print(f"Epoch {epoch+1:3d} | Loss {avg_loss:.5f} (eps: {avg_eps:.5f} | meta: {avg_meta:.4f}) "
+                  f"| LR {current_lr:.2e} | MetaW {meta_weight:.3f} | GradNorm {grad_norm:.3f}")
+            print(f"  DEBUG TRAIN → eps_norm={out['eps'].abs().mean().item():.3f}±{out['eps'].abs().std().item():.3f} "
+                  f"| meta_range=[{out['meta'].min().item():.2f}, {out['meta'].max().item():.2f}]")
 
-            if (epoch + 1) % eval_freq == 0:
-                eval_start = time.perf_counter()
-                avg_ret, ret_std = quick_eval(ema.shadow, env)
-                eval_time = time.perf_counter() - eval_start
-                ckpt_path = f"{ckpt_dir}/epoch_{(epoch+1):04d}_ret{avg_ret:.1f}.pt"
-                checkpoint = {
-                    "model": model.state_dict(),
-                    "ema": ema.state_dict(),
-                    "critic": critic.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "critic_optimizer": critic_optimizer.state_dict(),
-                    "scheduler": scheduler.state_dict(),
-                    "epoch": epoch + 1,
-                    "loss": avg_loss,
-                    "avg_return": avg_ret,
-                }
-                torch.save(checkpoint, ckpt_path)
-                print(f"Checkpoint → {ckpt_path} | AvgReturn: {avg_ret:.2f} ±{ret_std:.1f} | Eval time: {eval_time:.1f}s")
+            if writer:
+                writer.add_scalar("Loss/total", avg_loss, epoch)
+                writer.add_scalar("Loss/eps", avg_eps, epoch)
+                writer.add_scalar("Loss/meta", avg_meta, epoch)
+                writer.add_scalar("Hyper/lr", current_lr, epoch)
+                writer.add_scalar("Hyper/meta_weight", meta_weight, epoch)
 
-                score = avg_ret - 0.3 * ret_std
-                if score > best_score:
-                    best_score = score
-                    torch.save(checkpoint, best_path)
-                    print("  → New BEST (volatility-penalized) model saved")
+            if (epoch + 1) % cfg.eval_freq == 0 or epoch == 0:
+                avg_ret = evaluator.evaluate(ema.shadow, env, n_ep=3, steps=cfg.inference_steps)
+                if writer:
+                    writer.add_scalar("Eval/return_mean", avg_ret, epoch)
 
-                spike, loss_std, return_std, boost_meta = outer_ctrl.update(avg_loss, avg_ret, meta_ctrl.meta_weight, ret_std)
-                if spike or ret_std > 90:
-                    print("  → OuterController: SPIKE or HIGH VOL – resetting scheduler")
-                    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-                        optimizer, T_0=300, T_mult=1, eta_min=5e-6
-                    )
-                if boost_meta:
-                    meta_ctrl.meta_weight = min(0.30, meta_ctrl.meta_weight * 1.25)
-                    meta_ctrl.meta_weight_floor = max(0.05, meta_ctrl.meta_weight_floor * 1.15)
-
-                hyper_params = hyper_ctrl.update(avg_ret, loss_std, return_std, avg_vel)
-                meta_ctrl.hyper = hyper_params
-
-                if meta_ctrl.update(avg_ret, avg_loss):
-                    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-                        optimizer, T_0=300, T_mult=1, eta_min=5e-6
-                    )
+                if epoch >= cfg.meta_start:
+                    if avg_ret > 100:
+                        meta_weight = min(0.25, meta_weight * 1.03)
+                    else:
+                        meta_weight = max(0.08, meta_weight * 0.97)
 
     except KeyboardInterrupt:
-        print("\n\nKeyboardInterrupt detected. Saving interrupted checkpoint...")
-        interrupted_path = f"{ckpt_dir}/interrupted_epoch_{epoch+1}_ret{avg_ret if 'avg_ret' in locals() else 'unknown'}.pt"
-        checkpoint = {
-            "model": model.state_dict(),
-            "ema": ema.state_dict(),
-            "critic": critic.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "critic_optimizer": critic_optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
-            "epoch": epoch + 1,
-            "loss": avg_loss if 'avg_loss' in locals() else 0.0,
-            "avg_return": avg_ret if 'avg_ret' in locals() else 0.0,
-        }
-        torch.save(checkpoint, interrupted_path)
-        print(f"Interrupted state saved → {interrupted_path}")
-        raise
+        print("\nKeyboardInterrupt → saving interrupted checkpoint...")
+        os.makedirs(f"checkpoints/{cfg.env_name.lower()}", exist_ok=True)
+        torch.save(ema.shadow.state_dict(), f"checkpoints/{cfg.env_name.lower()}/interrupted.pt")
+    finally:
+        if writer:
+            writer.close()
 
-    final_path = f"hseaf_{env_name.lower()}_offline.pt"
-    torch.save({
-        "model": model.state_dict(),
-        "ema": ema.state_dict(),
-        "critic": critic.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "critic_optimizer": critic_optimizer.state_dict(),
-        "scheduler": scheduler.state_dict(),
-        "epoch": epoch + 1,
-        "loss": avg_loss,
-        "avg_return": avg_ret if "avg_ret" in locals() else 0.0,
-    }, final_path)
-    print(f"Training complete → {final_path}")
+    print("Training finished.")
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Offline DiT pre-training - HSEAF-HDP v2")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--env", default="Hopper-v5")
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--micro-batch-size", type=int, default=131072)
-    parser.add_argument("--grad-accum-steps", type=int, default=1)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--eval-freq", type=int, default=20)
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--epochs", type=int, default=2000)
+    parser.add_argument("--force-new", action="store_true")
+    parser.add_argument("--inference-denoising-steps", type=int, default=30)
+    parser.add_argument("--target-rtg", type=float, default=950.0)
     args = parser.parse_args()
 
-    train_dit_offline(
+    cfg = Config(
         env_name=args.env,
         epochs=args.epochs,
-        micro_batch_size=args.micro_batch_size,
-        grad_accum_steps=args.grad_accum_steps,
-        lr=args.lr,
-        eval_freq=args.eval_freq,
-        num_workers=args.num_workers,
+        inference_steps=args.inference_denoising_steps,
+        target_rtg=args.target_rtg,
     )
+
+    os.makedirs(f"checkpoints/{cfg.env_name.lower()}", exist_ok=True)
+    train_dit_offline(cfg)
