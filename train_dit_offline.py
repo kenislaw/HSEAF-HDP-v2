@@ -12,7 +12,8 @@ import copy
 import time
 from datetime import timedelta
 
-# ==================== EMA (unchanged) ====================
+# EMA and CheckpointManager unchanged (same as before)
+
 class EMA:
     def __init__(self, model, decay=0.9997, warm_up_steps=1000):
         self.decay = decay
@@ -33,7 +34,6 @@ class EMA:
         return self.ema_model
 
 
-# ==================== CHECKPOINT (unchanged) ====================
 class CheckpointManager:
     def __init__(self):
         self.model = None
@@ -65,7 +65,7 @@ class CheckpointManager:
 manager = CheckpointManager()
 
 
-# ==================== DiT (unchanged) ====================
+# DiT unchanged
 class DiTBlock(nn.Module):
     def __init__(self, hidden_dim=256):
         super().__init__()
@@ -120,7 +120,7 @@ class DiT(nn.Module):
         return self.head(x)
 
 
-# ==================== LOSSES ====================
+# Losses unchanged
 def action_reg_loss(pred):
     return 0.001 * torch.mean(pred ** 2)
 
@@ -134,7 +134,7 @@ def reward_weighted_bc_loss(pred, target, bc_weight=8.0):
     return bc_weight * F.mse_loss(pred, target, reduction='mean')
 
 
-# ==================== NORMALIZATION (warning-free) ====================
+# Normalization (same)
 state_mean = None
 state_std = None
 action_mean = None
@@ -184,7 +184,7 @@ def normalize_rtg(rtg):
         return (rtg - rtg_min) / (rtg_max - rtg_min + 1e-6)
 
 
-# ==================== EVAL (every 10 epochs in training loop) ====================
+# EVAL unchanged
 last_eval_return = "N/A"
 last_eval_std = "N/A"
 last_eval_height = 0.0
@@ -262,7 +262,7 @@ def evaluate(model, env, num_episodes=10):
     return mean_ret, std_ret, last_eval_height
 
 
-# ==================== TRAINING (with soft stability bonus) ====================
+# TRAINING with stronger stability + percentile RTG sampling
 def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device} | {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
@@ -285,7 +285,7 @@ def train(args):
             rtgs_raw = rtgs_raw.flatten()
         rtgs = rtgs_raw.reshape(-1, 1)
 
-        global state_mean, state_std, action_mean, action_std, dataset_action_mean, dataset_action_std, rtg_min, rtg_max
+        global state_mean, state_std, action_mean, action_std, dataset_action_mean, dataset_action_std, rtg_min, rtg_max, dataset_rtg_values
         state_mean = torch.from_numpy(states.mean(axis=0)).float()
         state_std = torch.from_numpy(states.std(axis=0)).float().clamp(min=1e-4)
         action_mean = torch.from_numpy(actions_np.mean(axis=0)).float()
@@ -294,6 +294,7 @@ def train(args):
         dataset_action_std = actions_np.std(axis=0)
         rtg_min = float(rtgs_raw.min())
         rtg_max = float(rtgs_raw.max())
+        dataset_rtg_values = torch.from_numpy(rtgs_raw).float()
 
         print(f"State norm: mean={state_mean.numpy()[:5]}... std={state_std.numpy()[:5]}...")
         print(f"Action normalization: mean={action_mean.numpy()}, std={action_std.numpy()}")
@@ -311,7 +312,7 @@ def train(args):
     model = DiT(hidden_dim=args.hidden_dim, depth=args.depth).to(device)
     ema = EMA(model, decay=0.9997)
     param_count = sum(p.numel() for p in model.parameters())
-    print(f"Model: hidden={args.hidden_dim} depth={args.depth} | {param_count:,} params (RTG-conditioned DiT BC)")
+    print(f"Model: hidden={args.hidden_dim} depth={args.depth} | {param_count:,} params (Improved Stability)")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, betas=(0.9, 0.95), weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-5)
@@ -319,14 +320,14 @@ def train(args):
 
     eval_env = gym.make(args.env)
 
-    writer = SummaryWriter(log_dir=f"runs/{args.env}_dit_bc")
+    writer = SummaryWriter(log_dir=f"runs/{args.env}_dit_stable_v2")
     manager.model = model
     manager.ema_model = ema.ema_model
     manager.optimizer = optimizer
     manager.writer = writer
     manager.args = args
 
-    print("🚀 Training started (SOTA push: Strong BC + Soft Stability Bonus)")
+    print("🚀 Training started (Strong BC + Stronger High-RTG Stability + Percentile RTG)")
 
     start_time = time.time()
 
@@ -342,6 +343,11 @@ def train(args):
                 action_b = action_b.to(device, non_blocking=True)
                 rtg_b = rtg_b.to(device, non_blocking=True)
 
+                # Percentile RTG sampling for better high-return focus
+                if torch.rand(1).item() < 0.75:
+                    high_rtg = dataset_rtg_values[torch.randint(len(dataset_rtg_values)//2, len(dataset_rtg_values), (len(rtg_b),))]
+                    rtg_b = high_rtg.to(device).unsqueeze(-1).float()
+
                 state_norm = normalize_states(state_b)
                 action_norm = normalize_actions(action_b)
                 rtg_norm = normalize_rtg(rtg_b)
@@ -354,10 +360,11 @@ def train(args):
                     mean_l = mean_matching_loss(pred)
                     var_l = variance_matching_loss(pred)
 
-                    # Soft stability bonus on high-RTG samples (prevents shortening)
+                    # Stronger stability on high-RTG
                     stability_bonus = 0.0
-                    if rtg_norm.mean() > 0.7:  # high return trajectories
-                        stability_bonus = 0.02 * torch.mean(torch.clamp(torch.abs(pred), max=0.8))
+                    if rtg_norm.mean() > 0.6:
+                        stability_bonus = 0.05 * torch.mean(torch.clamp(pred[:, 0], min=0.0))  # thigh forward
+                        stability_bonus += 0.03 * torch.mean(torch.clamp(torch.abs(pred), max=0.8))
 
                     loss = bc_l + reg_l + mean_l + var_l + stability_bonus
 
@@ -374,7 +381,7 @@ def train(args):
 
             scheduler.step()
 
-            if epoch % 10 == 0:  # Faster feedback
+            if epoch % 10 == 0:
                 elapsed = time.time() - start_time
                 epoch_time = time.time() - epoch_start
                 current_lr = optimizer.param_groups[0]['lr']
