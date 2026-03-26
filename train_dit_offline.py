@@ -1,363 +1,414 @@
-import os
-import copy
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-import minari
-import gymnasium as gym
+from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
-from torch.utils.data import DataLoader
-from tqdm import tqdm
 import argparse
-from dataclasses import dataclass
 from torch.utils.tensorboard import SummaryWriter
-import warnings
+import os
+import gymnasium as gym
+import sys
+import copy
+import time
+from datetime import timedelta
 
-# ====================== GLOBAL SETTINGS ======================
-warnings.filterwarnings("ignore", category=UserWarning)
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
-torch.backends.cuda.enable_flash_sdp(True)
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.set_float32_matmul_precision('high')
-
-# ====================== CONFIG ======================
-@dataclass
-class Config:
-    env_name: str = "Hopper-v5"
-    epochs: int = 2000
-    micro_batch: int = 16384
-    grad_accum: int = 8
-    lr: float = 3e-4
-    eval_freq: int = 5
-    target_rtg: float = 950.0
-    inference_steps: int = 30
-    device: torch.device = torch.device("cuda")
-    embed_dim: int = 256
-    depth: int = 6
-    meta_start: int = 30
-
-
-def cosine_beta_schedule(timesteps: int = 1000, s: float = 0.008):
-    steps = timesteps + 1
-    x = torch.linspace(0, timesteps, steps)
-    alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * torch.pi * 0.5) ** 2
-    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-    return torch.clamp(betas, 0.0001, 0.9999)
-
-
-# ====================== MODEL ======================
-class DiT1D(torch.nn.Module):
-    def __init__(self, state_dim: int, action_dim: int, embed_dim: int = 256, depth: int = 6):
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.state_embed = torch.nn.Linear(state_dim, embed_dim)
-        self.action_embed = torch.nn.Linear(action_dim, embed_dim)
-        self.time_embed = torch.nn.Sequential(
-            torch.nn.Linear(1, embed_dim), torch.nn.SiLU(), torch.nn.Linear(embed_dim, embed_dim)
-        )
-        self.rtg_proj = torch.nn.Linear(1, embed_dim)
-        layer = torch.nn.TransformerEncoderLayer(
-            d_model=embed_dim, nhead=8, dim_feedforward=embed_dim * 4,
-            activation='gelu', batch_first=True, norm_first=True
-        )
-        self.transformer = torch.nn.TransformerEncoder(layer, num_layers=depth)
-        self.eps_head = torch.nn.Linear(embed_dim, action_dim)
-        self.meta_head = torch.nn.Linear(embed_dim, 1)
-
-    def forward(self, state, x_t, t, rtg=None):
-        s_emb = self.state_embed(state)
-        if rtg is not None:
-            s_emb = s_emb + self.rtg_proj(rtg.unsqueeze(-1))
-        x_emb = self.action_embed(x_t)
-        t_emb = self.time_embed(t.view(-1, 1))
-        x = torch.stack([s_emb, x_emb, t_emb], dim=1)
-        x = self.transformer(x)
-        return {
-            "eps": self.eps_head(x[:, 1, :]),
-            "meta": self.meta_head(x.mean(dim=1)).squeeze(-1)
-        }
-
-
-# ====================== DATASET ======================
-class MinariTrajectoryDataset(torch.utils.data.Dataset):
-    def __init__(self, dataset, device):
-        self.states = []
-        self.actions = []
-        self.raw_returns = []
-        for ep in dataset:
-            min_len = min(len(ep.observations), len(ep.actions))
-            if min_len == 0:
-                continue
-            self.states.extend(ep.observations[:min_len])
-            self.actions.extend(ep.actions[:min_len])
-            cum_ret = np.cumsum(getattr(ep, 'rewards', np.zeros(min_len))[::-1])[::-1]
-            self.raw_returns.extend(cum_ret)
-
-        self.states_np = np.array(self.states, dtype=np.float32)
-        self.state_mean = self.states_np.mean(0)
-        self.state_std = self.states_np.std(0) + 1e-6
-        self.states = torch.tensor(
-            (self.states_np - self.state_mean) / self.state_std, dtype=torch.float32
-        ).to(device)
-
-        self.actions_np = np.array(self.actions, dtype=np.float32)
-        self.action_mean = self.actions_np.mean(0)
-        self.action_std = self.actions_np.std(0) + 1e-6
-        self.actions = torch.tensor(
-            (self.actions_np - self.action_mean) / self.action_std, dtype=torch.float32
-        ).to(device)
-
-        returns_array = np.clip(np.array(self.raw_returns), 0, 3500)
-        self.raw_returns = torch.tensor(returns_array, dtype=torch.float32).to(device)
-        self.returns = self.raw_returns / 1000.0
-
-        print(f"Pre-loaded dataset to GPU | {len(self.states):,} transitions "
-              f"(returns clipped & scaled /1000)")
-
-    def __len__(self):
-        return len(self.states)
-
-    def __getitem__(self, idx):
-        return self.states[idx], self.actions[idx], self.returns[idx], self.raw_returns[idx]
-
-
-# ====================== EMA ======================
+# ==================== EMA ====================
 class EMA:
-    def __init__(self, model, decay=0.999):
-        self.shadow = copy.deepcopy(model)
+    def __init__(self, model, decay=0.9997, warm_up_steps=1000):
         self.decay = decay
+        self.warm_up_steps = warm_up_steps
+        self.ema_model = copy.deepcopy(model)
+        for p in self.ema_model.parameters():
+            p.requires_grad = False
+        self.step = 0
 
     def update(self, model):
-        for p, s in zip(model.parameters(), self.shadow.parameters()):
-            s.data.mul_(self.decay).add_(p.data, alpha=1 - self.decay)
+        self.step += 1
+        current_decay = min(self.decay, 0.99 + (self.decay - 0.99) * (self.step / self.warm_up_steps))
+        for ema_p, p in zip(self.ema_model.parameters(), model.parameters()):
+            ema_p.data.mul_(current_decay).add_(p.data, alpha=1 - current_decay)
 
-    def state_dict(self):
-        return self.shadow.state_dict()
-
-
-# ====================== EVALUATOR ======================
-class QuickEvaluator:
-    def __init__(self, traj_ds, device, target_rtg=950.0):
-        self.traj_ds = traj_ds
-        self.device = device
-        self.target_rtg = target_rtg / 1000.0
-        self.betas = cosine_beta_schedule()
-        self.alphas_cumprod = torch.cumprod(1 - self.betas, dim=0).to(device)
-
-    def evaluate(self, model, env, n_ep=3, steps=30):
-        model.eval()
-        returns = []
-        all_heights = []
-        all_actions = []
-        stride = max(1, 1000 // steps)
-        rtg_t = torch.full((1,), self.target_rtg, device=self.device)
-
-        print(f"\n{'='*70}")
-        print(f"→ Eval {n_ep}×2 episodes (DDIM steps={steps})...")
-
-        for ep_idx in range(n_ep):
-            for s_idx in range(2):
-                obs, _ = env.reset()
-                ep_ret = 0.0
-                ep_heights = []
-                ep_actions = []
-
-                for _ in range(1000):
-                    x_t = torch.randn((1, env.action_space.shape[0]), device=self.device)
-
-                    for d in range(steps):
-                        t_idx = 999 - d * stride
-                        t = torch.full((1,), t_idx / 1000.0, device=self.device)
-                        progress = d / steps
-                        guidance = 0.5 + 4.0 * (1 - progress ** 0.6)
-
-                        state_t = torch.from_numpy(
-                            (obs - self.traj_ds.state_mean) / self.traj_ds.state_std
-                        ).float().unsqueeze(0).to(self.device)
-
-                        with torch.no_grad():
-                            out_c = model(state_t, x_t, t, rtg=rtg_t)
-                            out_u = model(state_t, x_t, t, rtg=None)
-                            eps = out_u["eps"] + guidance * (out_c["eps"] - out_u["eps"])
-
-                        alpha_t = self.alphas_cumprod[t_idx]
-                        alpha_p = self.alphas_cumprod[max(0, t_idx - stride)]
-                        pred_x0 = (x_t - torch.sqrt(1 - alpha_t) * eps) / torch.sqrt(alpha_t)
-                        x_t = torch.sqrt(alpha_p) * pred_x0 + torch.sqrt(1 - alpha_p) * eps
-                        x_t = x_t.clamp(-2.5, 2.5)
-
-                    act_norm = x_t[0].cpu().numpy()
-                    act = (act_norm * self.traj_ds.action_std + self.traj_ds.action_mean).clip(
-                        env.action_space.low * 0.95, env.action_space.high * 0.95)
-
-                    obs, r, term, trunc, _ = env.step(act)
-                    ep_ret += r
-                    ep_heights.append(obs[0])
-                    ep_actions.append(np.abs(act).mean())
-
-                    if term or trunc or obs[0] < 0.7:
-                        break
-
-                returns.append(ep_ret)
-                all_heights.extend(ep_heights)
-                all_actions.extend(ep_actions)
-
-                print(f"  [{ep_idx}][{s_idx}] ret={ep_ret:7.1f} len={len(ep_heights):3d} "
-                      f"max_h={max(ep_heights):.2f} act_norm={np.mean(ep_actions):.3f}")
-
-        avg_ret = np.mean(returns)
-        ret_std = np.std(returns)
-        avg_h = np.mean(all_heights)
-        h_min, h_max = np.min(all_heights), np.max(all_heights)
-        avg_act = np.mean(all_actions)
-        early_death_pct = 100 * sum(h < 0.7 for h in all_heights) / len(all_heights)
-
-        bins = [0.0, 0.7, 1.0, 1.3, 1.6, 2.0]
-        hist, _ = np.histogram(all_heights, bins=bins)
-        hist_str = " | ".join([f"{bins[i]:.1f}-{bins[i+1]:.1f}:{hist[i]/len(all_heights)*100:4.0f}%" for i in range(len(hist))])
-
-        print(f"{'-'*70}")
-        print(f"DEBUG EVAL → avg_ret={avg_ret:6.1f}±{ret_std:.1f} | avg_height={avg_h:.2f} "
-              f"(min={h_min:.2f}, max={h_max:.2f}) | action_norm={avg_act:.3f}")
-        print(f"             early_death={early_death_pct:.1f}% | height_dist: {hist_str}")
-        print(f"{'='*70}\n")
-
-        model.train()
-        return avg_ret
+    def eval(self):
+        self.ema_model.eval()
+        return self.ema_model
 
 
-# ====================== MAIN TRAINER ======================
-def train_dit_offline(cfg: Config):
-    effective_batch = cfg.micro_batch * cfg.grad_accum
-    lr_scaled = cfg.lr * (effective_batch ** 0.5 / 256)
+# ==================== CHECKPOINT ====================
+class CheckpointManager:
+    def __init__(self):
+        self.model = None
+        self.ema_model = None
+        self.optimizer = None
+        self.epoch = 0
+        self.loss = 0.0
+        self.writer = None
+        self.args = None
 
-    print(f"Using device: {cfg.device} | {torch.cuda.get_device_name(0)}")
-    print(f"Effective batch size: {effective_batch} | Scaled LR: {lr_scaled:.2e}")
+    def save(self):
+        if self.model is None:
+            return
+        os.makedirs("checkpoints", exist_ok=True)
+        ckpt_path = f"checkpoints/{self.args.env}_dit_latest.pt"
+        torch.save({
+            'epoch': self.epoch,
+            'model_state_dict': self.model.state_dict(),
+            'ema_state_dict': self.ema_model.state_dict() if self.ema_model else None,
+            'optimizer_state_dict': self.optimizer.state_dict() if self.optimizer else None,
+            'loss': self.loss,
+        }, ckpt_path)
+        print(f"✅ Checkpoint saved → {ckpt_path}")
+        if self.writer:
+            self.writer.close()
+            print("✅ TensorBoard writer closed")
 
-    ds_id = f"mujoco/{cfg.env_name.lower().replace('-v5', '')}/medium-v0"
-    dataset = minari.load_dataset(ds_id, download=True)
-    env = gym.make(cfg.env_name)
-    state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.shape[0]
 
-    model = DiT1D(state_dim, action_dim, cfg.embed_dim, cfg.depth).to(cfg.device)
+manager = CheckpointManager()
 
-    # Force eager mode - torch.compile is broken on RTX 5070 (Blackwell + Triton missing)
-    print("torch.compile disabled (Blackwell GPU) → using eager mode for stability")
 
-    ema = EMA(model)
-    traj_ds = MinariTrajectoryDataset(dataset, cfg.device)
-    loader = DataLoader(traj_ds, batch_size=cfg.micro_batch, shuffle=True, num_workers=0, pin_memory=False)
+# ==================== DiT (RTG-conditioned BC) ====================
+class DiTBlock(nn.Module):
+    def __init__(self, hidden_dim=256):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.norm2 = nn.LayerNorm(hidden_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 4),
+            nn.GELU(),
+            nn.Linear(hidden_dim * 4, hidden_dim),
+        )
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 6 * hidden_dim, bias=True),
+        )
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr_scaled, weight_decay=1e-4)
-    scaler = torch.amp.GradScaler('cuda')
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=300, eta_min=1e-4)
+    def forward(self, x, t_emb):
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(t_emb).chunk(6, dim=1)
+        x_norm = self.norm1(x) * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
+        x = x + gate_msa.unsqueeze(1) * self.mlp(x_norm)
+        x_norm = self.norm2(x) * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(x_norm)
+        return x.contiguous()
 
-    log_dir = f"runs/{cfg.env_name.lower()}_dit_v32"
-    writer = SummaryWriter(log_dir)
-    print(f"TensorBoard logging enabled → {log_dir}")
-    print("   View with: tensorboard --logdir runs\n")
 
-    evaluator = QuickEvaluator(traj_ds, cfg.device, cfg.target_rtg)
+class DiT(nn.Module):
+    def __init__(self, hidden_dim=256, depth=6, state_dim=11, action_dim=3, rtg_dim=1):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.time_embed = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 4),
+            nn.SiLU(),
+            nn.Linear(hidden_dim * 4, hidden_dim),
+        )
+        self.state_embed = nn.Linear(state_dim, hidden_dim)
+        self.rtg_embed = nn.Linear(rtg_dim, hidden_dim)
+        self.blocks = nn.ModuleList([DiTBlock(hidden_dim) for _ in range(depth)])
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.head = nn.Linear(hidden_dim, action_dim)
+        self.head.bias.data.zero_()
 
-    meta_weight = 0.08
-    print("Starting training...\n")
+    def forward(self, state, rtg):
+        if rtg.dim() == 1:
+            rtg = rtg.unsqueeze(-1)
+        t = torch.zeros(state.shape[0], device=state.device)
+        t_emb = self.time_embed(t.unsqueeze(-1).expand(-1, self.hidden_dim))
+        
+        x = self.state_embed(state) + self.rtg_embed(rtg)
+        x = x.unsqueeze(1)
+        for block in self.blocks:
+            x = block(x, t_emb)
+        x = self.norm(x.squeeze(1))
+        return self.head(x)
+
+
+# ==================== LOSSES ====================
+def action_reg_loss(pred):
+    return 0.001 * torch.mean(pred ** 2)
+
+def variance_matching_loss(pred):
+    return 0.25 * torch.mean((pred.std(dim=0) - 1.0) ** 2)
+
+def mean_matching_loss(pred):
+    return 0.05 * torch.mean(pred ** 2)
+
+def reward_weighted_bc_loss(pred, target, bc_weight=8.0):
+    return bc_weight * F.mse_loss(pred, target, reduction='mean')
+
+
+# ==================== NORMALIZATION (warning-free) ====================
+state_mean = None
+state_std = None
+action_mean = None
+action_std = None
+dataset_action_mean = None
+dataset_action_std = None
+rtg_min = 0.0   # will be set as float
+rtg_max = 3.9   # will be set as float
+
+def normalize_states(states):
+    global state_mean, state_std
+    if state_mean is None:
+        mean_np = states.mean(axis=0)
+        std_np = states.std(axis=0).clip(min=1e-4)
+        state_mean = torch.from_numpy(mean_np).float()
+        state_std = torch.from_numpy(std_np).float()
+    if isinstance(states, torch.Tensor):
+        return (states - state_mean.to(states.device)) / state_std.to(states.device)
+    return (states - state_mean.numpy()) / state_std.numpy()
+
+def normalize_actions(actions):
+    global action_mean, action_std, dataset_action_mean, dataset_action_std
+    if action_mean is None:
+        mean_np = actions.mean(axis=0)
+        std_np = actions.std(axis=0).clip(min=1e-4)
+        action_mean = torch.from_numpy(mean_np).float()
+        action_std = torch.from_numpy(std_np).float()
+        dataset_action_mean = mean_np
+        dataset_action_std = std_np
+    if isinstance(actions, torch.Tensor):
+        return (actions - action_mean.to(actions.device)) / action_std.to(actions.device)
+    return (actions - action_mean.numpy()) / action_std.numpy()
+
+def denormalize_actions(norm_actions):
+    global action_mean, action_std
+    if isinstance(norm_actions, torch.Tensor):
+        return norm_actions * action_std.to(norm_actions.device) + action_mean.to(norm_actions.device)
+    return norm_actions * action_std.numpy() + action_mean.numpy()
+
+def normalize_rtg(rtg):
+    """Warning-free RTG normalization"""
+    global rtg_min, rtg_max
+    if isinstance(rtg, torch.Tensor):
+        # Create fresh scalars on correct device
+        min_t = torch.tensor(rtg_min, device=rtg.device, dtype=rtg.dtype)
+        max_t = torch.tensor(rtg_max, device=rtg.device, dtype=rtg.dtype)
+        return (rtg - min_t) / (max_t - min_t + 1e-6)
+    else:
+        return (rtg - rtg_min) / (rtg_max - rtg_min + 1e-6)
+
+
+# ==================== EVAL ====================
+last_eval_return = "N/A"
+last_eval_std = "N/A"
+last_eval_height = 0.0
+last_eval_vel = 0.0
+last_eval_mean_action = None
+last_eval_length = 0.0
+last_eval_ctrl_cost = 0.0
+last_eval_act_std = None
+last_eval_leg_torque = 0.0
+
+def evaluate(model, env, num_episodes=10):
+    global last_eval_return, last_eval_std, last_eval_height, last_eval_vel, last_eval_mean_action, last_eval_length, last_eval_ctrl_cost, last_eval_act_std, last_eval_leg_torque
+    returns = []
+    heights = []
+    vels = []
+    action_means = []
+    action_stds = []
+    lengths = []
+    ctrl_costs = []
+    device = next(model.parameters()).device
+
+    rtg_val = 1.0
+    rtg_tensor = torch.tensor([[rtg_val]], dtype=torch.float32, device=device)
+
+    for _ in range(num_episodes):
+        state, _ = env.reset()
+        total_r = 0.0
+        max_h = 0.0
+        total_vel = 0.0
+        total_action = np.zeros(3)
+        total_ctrl = 0.0
+        steps = 0
+
+        for _ in range(1000):
+            state_norm = normalize_states(torch.from_numpy(state).float().unsqueeze(0).to(device))
+            with torch.no_grad():
+                action_norm = model(state_norm, rtg_tensor)
+                action_norm += 0.08 * torch.randn_like(action_norm)
+
+            action_denorm = denormalize_actions(action_norm.squeeze(0)).cpu().numpy()
+            action_denorm = np.clip(action_denorm, -1.0, 1.0)
+
+            state, r, terminated, truncated, _ = env.step(action_denorm)
+
+            total_r += float(r) if not np.isnan(r) and not np.isinf(r) else 0.0
+            max_h = max(max_h, float(state[0]))
+            total_vel += float(state[5])
+            total_action += action_denorm
+            total_ctrl += 0.001 * np.sum(action_denorm ** 2)
+            steps += 1
+
+            if terminated or truncated:
+                break
+
+        returns.append(total_r)
+        heights.append(max_h)
+        vels.append(total_vel / max(steps, 1))
+        action_means.append(total_action / max(steps, 1))
+        action_stds.append(np.std(total_action / max(steps, 1), axis=0))
+        lengths.append(steps)
+        ctrl_costs.append(total_ctrl / max(steps, 1))
+
+    mean_ret = np.mean(returns)
+    std_ret = np.std(returns)
+    last_eval_return = f"{mean_ret:.1f}"
+    last_eval_std = f"{std_ret:.1f}"
+    last_eval_height = np.mean(heights)
+    last_eval_vel = np.mean(vels)
+    last_eval_mean_action = np.mean(action_means, axis=0)
+    last_eval_length = np.mean(lengths)
+    last_eval_ctrl_cost = np.mean(ctrl_costs)
+    last_eval_act_std = np.mean(action_stds)
+    last_eval_leg_torque = last_eval_mean_action[1]
+
+    return mean_ret, std_ret, last_eval_height
+
+
+# ==================== TRAINING ====================
+def train(args):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device} | {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision("high")
+    torch.cuda.empty_cache()
+    print("🧹 Cleared CUDA cache")
+
+    cache_path = "data/hopper_medium.npz"
+    os.makedirs("data", exist_ok=True)
+    if os.path.exists(cache_path):
+        print("Loading cached dataset...")
+        data = np.load(cache_path)
+        states = data['states']
+        actions_np = data['actions']
+        rtgs_raw = data['rtgs']
+        if rtgs_raw.ndim > 1:
+            rtgs_raw = rtgs_raw.flatten()
+        rtgs = rtgs_raw.reshape(-1, 1)
+
+        global state_mean, state_std, action_mean, action_std, dataset_action_mean, dataset_action_std, rtg_min, rtg_max
+        state_mean = torch.from_numpy(states.mean(axis=0)).float()
+        state_std = torch.from_numpy(states.std(axis=0)).float().clamp(min=1e-4)
+        action_mean = torch.from_numpy(actions_np.mean(axis=0)).float()
+        action_std = torch.from_numpy(actions_np.std(axis=0)).float().clamp(min=1e-4)
+        dataset_action_mean = actions_np.mean(axis=0)
+        dataset_action_std = actions_np.std(axis=0)
+        rtg_min = float(rtgs_raw.min())
+        rtg_max = float(rtgs_raw.max())
+
+        print(f"State norm: mean={state_mean.numpy()[:5]}... std={state_std.numpy()[:5]}...")
+        print(f"Action normalization: mean={action_mean.numpy()}, std={action_std.numpy()}")
+        print(f"Dataset mean action[0] (thigh): {action_mean[0].item():.4f}")
+        print(f"RTG range: {rtg_min:.1f} to {rtg_max:.1f}")
+    else:
+        raise FileNotFoundError("Cached dataset not found.")
+
+    ds = TensorDataset(torch.from_numpy(states), torch.from_numpy(actions_np), torch.from_numpy(rtgs))
+
+    loader = DataLoader(ds, batch_size=16384, shuffle=True,
+                        num_workers=6, pin_memory=True, drop_last=True,
+                        prefetch_factor=4, persistent_workers=True)
+
+    model = DiT(hidden_dim=args.hidden_dim, depth=args.depth).to(device)
+    ema = EMA(model, decay=0.9997)
+    param_count = sum(p.numel() for p in model.parameters())
+    print(f"Model: hidden={args.hidden_dim} depth={args.depth} | {param_count:,} params (RTG-conditioned DiT BC)")
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, betas=(0.9, 0.95), weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-5)
+    scaler = torch.amp.GradScaler(device="cuda")
+
+    eval_env = gym.make(args.env)
+
+    writer = SummaryWriter(log_dir=f"runs/{args.env}_dit_bc")
+    manager.model = model
+    manager.ema_model = ema.ema_model
+    manager.optimizer = optimizer
+    manager.writer = writer
+    manager.args = args
+
+    print("🚀 Training started (Strong RTG-conditioned BC – warning-free)")
+
+    start_time = time.time()
 
     try:
-        for epoch in range(cfg.epochs):
-            epoch_loss = eps_loss_sum = meta_loss_sum = n_samples = 0.0
-            optimizer.zero_grad()
+        for epoch in range(1, args.epochs + 1):
+            model.train()
+            epoch_loss = 0.0
+            step_count = 0
+            epoch_start = time.time()
 
-            pbar = tqdm(loader, desc=f"Epoch {epoch+1:3d}")
-            for states, actions, _, raw_returns in pbar:
-                with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    t = torch.rand(len(states), device=cfg.device)
-                    noise = torch.randn_like(actions)
-                    sqrt_alpha = torch.sqrt(1 - t[:, None])
-                    sqrt_one_minus_alpha = torch.sqrt(t[:, None])
-                    x_t = sqrt_alpha * actions + sqrt_one_minus_alpha * noise
+            for state_b, action_b, rtg_b in loader:
+                state_b = state_b.to(device, non_blocking=True)
+                action_b = action_b.to(device, non_blocking=True)
+                rtg_b = rtg_b.to(device, non_blocking=True)
 
-                    rtg = torch.full((len(states),), cfg.target_rtg / 1000.0, device=cfg.device) \
-                          if torch.rand(1).item() < 0.6 else None
+                state_norm = normalize_states(state_b)
+                action_norm = normalize_actions(action_b)
+                rtg_norm = normalize_rtg(rtg_b)
 
-                    out = model(states, x_t, t, rtg=rtg)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    pred = model(state_norm, rtg_norm)
+                    
+                    bc_l = reward_weighted_bc_loss(pred, action_norm, bc_weight=8.0)
+                    reg_l = action_reg_loss(pred)
+                    mean_l = mean_matching_loss(pred)
+                    var_l = variance_matching_loss(pred)
+                    loss = bc_l + reg_l + mean_l + var_l
 
-                    eps_loss = F.mse_loss(out["eps"], noise)
-                    meta_loss = F.mse_loss(out["meta"], (raw_returns / 1000.0 - 0.5) * 2.0)
-
-                    active_meta = meta_weight if epoch >= cfg.meta_start else 0.0
-                    loss = eps_loss + active_meta * meta_loss
-
+                optimizer.zero_grad(set_to_none=True)
                 scaler.scale(loss).backward()
-
-                if (n_samples // cfg.micro_batch + 1) % cfg.grad_accum == 0:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer.zero_grad()
-                    scheduler.step()
-                    ema.update(model)
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                ema.update(model)
 
                 epoch_loss += loss.item()
-                eps_loss_sum += eps_loss.item()
-                meta_loss_sum += meta_loss.item()
-                n_samples += len(states)
+                step_count += 1
 
-            avg_loss = epoch_loss / len(loader)
-            avg_eps = eps_loss_sum / len(loader)
-            avg_meta = meta_loss_sum / len(loader)
-            current_lr = optimizer.param_groups[0]['lr']
+            scheduler.step()
 
-            print(f"Epoch {epoch+1:3d} | Loss {avg_loss:.5f} (eps: {avg_eps:.5f} | meta: {avg_meta:.4f}) "
-                  f"| LR {current_lr:.2e} | MetaW {meta_weight:.3f} | GradNorm {grad_norm:.3f}")
-            print(f"  DEBUG TRAIN → eps_norm={out['eps'].abs().mean().item():.3f}±{out['eps'].abs().std().item():.3f} "
-                  f"| meta_range=[{out['meta'].min().item():.2f}, {out['meta'].max().item():.2f}]")
+            if epoch % 20 == 0:
+                elapsed = time.time() - start_time
+                epoch_time = time.time() - epoch_start
+                current_lr = optimizer.param_groups[0]['lr']
+                print(f"Epoch {epoch:4d} | Loss {epoch_loss/step_count:.4f} | LR {current_lr:.2e} | it/s {step_count/epoch_time:.1f} | Time {timedelta(seconds=int(elapsed))}")
 
-            if writer:
-                writer.add_scalar("Loss/total", avg_loss, epoch)
-                writer.add_scalar("Loss/eps", avg_eps, epoch)
-                writer.add_scalar("Loss/meta", avg_meta, epoch)
-                writer.add_scalar("Hyper/lr", current_lr, epoch)
-                writer.add_scalar("Hyper/meta_weight", meta_weight, epoch)
+                ema_model = ema.eval()
+                ret_mean, ret_std, avg_h = evaluate(ema_model, eval_env)
+                leg_sign = "POSITIVE" if last_eval_leg_torque > 0 else "NEGATIVE"
+                print(f"   → Eval Return {ret_mean:.1f}±{ret_std:.1f} | AvgTorsoHeight {avg_h:.3f} | AvgVel {last_eval_vel:.3f} | "
+                      f"AvgEpisodeLength {last_eval_length:.0f} | EstCtrlCost {last_eval_ctrl_cost:.3f} | "
+                      f"MeanAct {last_eval_mean_action} | ActStd {last_eval_act_std:.3f} | LegTorque {last_eval_leg_torque:.3f} ({leg_sign})")
+                print(f"   → Debug: Dataset mean {dataset_action_mean} std {dataset_action_std} | Model mean {last_eval_mean_action}")
 
-            if (epoch + 1) % cfg.eval_freq == 0 or epoch == 0:
-                avg_ret = evaluator.evaluate(ema.shadow, env, n_ep=3, steps=cfg.inference_steps)
-                if writer:
-                    writer.add_scalar("Eval/return_mean", avg_ret, epoch)
-
-                if epoch >= cfg.meta_start:
-                    if avg_ret > 100:
-                        meta_weight = min(0.25, meta_weight * 1.03)
-                    else:
-                        meta_weight = max(0.08, meta_weight * 0.97)
+            manager.epoch = epoch
+            manager.loss = epoch_loss / step_count
 
     except KeyboardInterrupt:
-        print("\nKeyboardInterrupt → saving interrupted checkpoint...")
-        os.makedirs(f"checkpoints/{cfg.env_name.lower()}", exist_ok=True)
-        torch.save(ema.shadow.state_dict(), f"checkpoints/{cfg.env_name.lower()}/interrupted.pt")
-    finally:
-        if writer:
-            writer.close()
+        print("\n⚠️ Training interrupted. Graceful shutdown...")
+        manager.save()
+        sys.exit(0)
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        manager.save()
+        raise
 
-    print("Training finished.")
+    manager.save()
+    writer.close()
+    eval_env.close()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--env", default="Hopper-v5")
+    parser.add_argument("--env", type=str, default="Hopper-v5")
     parser.add_argument("--epochs", type=int, default=2000)
-    parser.add_argument("--force-new", action="store_true")
-    parser.add_argument("--inference-denoising-steps", type=int, default=30)
-    parser.add_argument("--target-rtg", type=float, default=950.0)
+    parser.add_argument("--meta-decouple-factor", type=float, default=0.0)
+    parser.add_argument("--bc-weight", type=float, default=8.0)
+    parser.add_argument("--hidden-dim", type=int, default=256)
+    parser.add_argument("--depth", type=int, default=6)
     args = parser.parse_args()
 
-    cfg = Config(
-        env_name=args.env,
-        epochs=args.epochs,
-        inference_steps=args.inference_denoising_steps,
-        target_rtg=args.target_rtg,
-    )
-
-    os.makedirs(f"checkpoints/{cfg.env_name.lower()}", exist_ok=True)
-    train_dit_offline(cfg)
+    train(args)
