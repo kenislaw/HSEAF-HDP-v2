@@ -12,7 +12,7 @@ import copy
 import time
 from datetime import timedelta
 
-# ==================== EMA ====================
+# ==================== EMA (unchanged) ====================
 class EMA:
     def __init__(self, model, decay=0.9997, warm_up_steps=1000):
         self.decay = decay
@@ -33,7 +33,7 @@ class EMA:
         return self.ema_model
 
 
-# ==================== CHECKPOINT ====================
+# ==================== CHECKPOINT (unchanged) ====================
 class CheckpointManager:
     def __init__(self):
         self.model = None
@@ -65,7 +65,7 @@ class CheckpointManager:
 manager = CheckpointManager()
 
 
-# ==================== DiT (RTG-conditioned BC) ====================
+# ==================== DiT (unchanged) ====================
 class DiTBlock(nn.Module):
     def __init__(self, hidden_dim=256):
         super().__init__()
@@ -141,8 +141,8 @@ action_mean = None
 action_std = None
 dataset_action_mean = None
 dataset_action_std = None
-rtg_min = 0.0   # will be set as float
-rtg_max = 3.9   # will be set as float
+rtg_min = 0.0
+rtg_max = 3.9
 
 def normalize_states(states):
     global state_mean, state_std
@@ -175,10 +175,8 @@ def denormalize_actions(norm_actions):
     return norm_actions * action_std.numpy() + action_mean.numpy()
 
 def normalize_rtg(rtg):
-    """Warning-free RTG normalization"""
     global rtg_min, rtg_max
     if isinstance(rtg, torch.Tensor):
-        # Create fresh scalars on correct device
         min_t = torch.tensor(rtg_min, device=rtg.device, dtype=rtg.dtype)
         max_t = torch.tensor(rtg_max, device=rtg.device, dtype=rtg.dtype)
         return (rtg - min_t) / (max_t - min_t + 1e-6)
@@ -186,7 +184,7 @@ def normalize_rtg(rtg):
         return (rtg - rtg_min) / (rtg_max - rtg_min + 1e-6)
 
 
-# ==================== EVAL ====================
+# ==================== EVAL (every 10 epochs in training loop) ====================
 last_eval_return = "N/A"
 last_eval_std = "N/A"
 last_eval_height = 0.0
@@ -264,7 +262,7 @@ def evaluate(model, env, num_episodes=10):
     return mean_ret, std_ret, last_eval_height
 
 
-# ==================== TRAINING ====================
+# ==================== TRAINING (with soft stability bonus) ====================
 def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device} | {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
@@ -328,7 +326,7 @@ def train(args):
     manager.writer = writer
     manager.args = args
 
-    print("🚀 Training started (Strong RTG-conditioned BC – warning-free)")
+    print("🚀 Training started (SOTA push: Strong BC + Soft Stability Bonus)")
 
     start_time = time.time()
 
@@ -355,7 +353,13 @@ def train(args):
                     reg_l = action_reg_loss(pred)
                     mean_l = mean_matching_loss(pred)
                     var_l = variance_matching_loss(pred)
-                    loss = bc_l + reg_l + mean_l + var_l
+
+                    # Soft stability bonus on high-RTG samples (prevents shortening)
+                    stability_bonus = 0.0
+                    if rtg_norm.mean() > 0.7:  # high return trajectories
+                        stability_bonus = 0.02 * torch.mean(torch.clamp(torch.abs(pred), max=0.8))
+
+                    loss = bc_l + reg_l + mean_l + var_l + stability_bonus
 
                 optimizer.zero_grad(set_to_none=True)
                 scaler.scale(loss).backward()
@@ -370,7 +374,7 @@ def train(args):
 
             scheduler.step()
 
-            if epoch % 20 == 0:
+            if epoch % 10 == 0:  # Faster feedback
                 elapsed = time.time() - start_time
                 epoch_time = time.time() - epoch_start
                 current_lr = optimizer.param_groups[0]['lr']
